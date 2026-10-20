@@ -33,6 +33,32 @@ def find_data_dir():
 DATA_DIR = find_data_dir()
 
 
+def find_csv_file(data_dir, patterns):
+    if not data_dir.exists():
+        return None
+    files = sorted(p for p in data_dir.iterdir() if p.is_file() and p.suffix.lower() == ".csv")
+    for pattern in patterns:
+        for candidate in files:
+            if candidate.name.lower() == pattern.lower():
+                return candidate
+    for pattern in patterns:
+        lowered = pattern.lower()
+        for candidate in files:
+            if lowered in candidate.name.lower():
+                return candidate
+    return None
+
+
+def required_csv_map(data_dir):
+    return {
+        "person": find_csv_file(data_dir, ["person.csv", "person_*.csv"]),
+        "condition": find_csv_file(data_dir, ["condition_occurrence.csv", "condition*.csv"]),
+        "drug": find_csv_file(data_dir, ["drug_exposure.csv", "drug*.csv"]),
+        "procedure": find_csv_file(data_dir, ["procedure_occurrence.csv", "procedure*.csv"]),
+        "measurement": find_csv_file(data_dir, ["measurement.csv", "measurement*.csv"]),
+    }
+
+
 @st.cache_data
 def load_table(filename):
     path = DATA_DIR / filename
@@ -85,15 +111,6 @@ def summarize_common_field(df, patient_ids, label_columns, label_name, value_nam
 
 
 def build_case_summary(selected_id, similar_df, drug_summary, procedure_summary, measurement_summary):
-    evidence = {
-        "selected_patient_id": selected_id,
-        "similar_patient_count": len(similar_df),
-        "top_drugs": drug_summary.head(5).to_dict(orient="records"),
-        "top_procedures": procedure_summary.head(5).to_dict(orient="records"),
-        "top_measurements": measurement_summary.head(5).to_dict(orient="records"),
-        "top_similar_patients": similar_df.head(5).to_dict(orient="records"),
-    }
-
     top_drug = drug_summary.iloc[0]["Drug"] if not drug_summary.empty else "no common drug pattern"
     top_proc = procedure_summary.iloc[0]["Procedure"] if not procedure_summary.empty else "no common procedure pattern"
     top_meas = measurement_summary.iloc[0]["Measurement"] if not measurement_summary.empty else "no common lab pattern"
@@ -157,22 +174,38 @@ def generate_ai_summary(selected_patient_id, similarity_df, therapy_summary, pro
         return f"AI summary could not be generated: {exc}"
 
 
-person = load_table("person.csv")
-conditions = load_table("condition_occurrence.csv")
-drugs = load_table("drug_exposure.csv")
-procedures = load_table("procedure_occurrence.csv")
-measurements = load_table("measurement.csv")
+required_files = required_csv_map(DATA_DIR)
+available_csvs = sorted(
+    [p.name for p in DATA_DIR.iterdir() if p.is_file() and p.suffix.lower() == ".csv"]
+) if DATA_DIR.exists() else []
+
+if DATA_DIR.exists() and not required_files["person"]:
+    st.error(
+        f"Missing required OMOP files in {DATA_DIR}. "
+        f"Expected at least `person.csv` (and `condition_occurrence.csv`, `drug_exposure.csv`, `procedure_occurrence.csv`, `measurement.csv`). "
+        f"Files found: {available_csvs[:20]}"
+    )
+    st.stop()
+
+person = load_table(required_files["person"].name if required_files["person"] else "person.csv")
+conditions = load_table(required_files["condition"].name if required_files["condition"] else "condition_occurrence.csv")
+drugs = load_table(required_files["drug"].name if required_files["drug"] else "drug_exposure.csv")
+procedures = load_table(required_files["procedure"].name if required_files["procedure"] else "procedure_occurrence.csv")
+measurements = load_table(required_files["measurement"].name if required_files["measurement"] else "measurement.csv")
 
 st.title("Clinical Patient Explorer")
 st.caption("Explore a patient, compare them with a similar cohort, and review the treatment patterns used in prior comparable cases.")
 
 if person.empty or conditions.empty:
-    st.error(f"Could not find required files in {DATA_DIR}")
+    st.error(
+        f"Could not find the required OMOP patient tables in {DATA_DIR}. "
+        f"Expected `person.csv` and `condition_occurrence.csv`; checked folder contents: {available_csvs[:20]}"
+    )
     st.stop()
 
 patient_ids = normalize_patient_ids(person["person_id"])
 if not patient_ids:
-    st.warning("No valid patient IDs were found in `person.csv`.")
+    st.warning("No valid patient IDs were found in the person table.")
     st.stop()
 
 profiles = {pid: get_condition_profile(conditions, pid) for pid in patient_ids}
@@ -260,9 +293,7 @@ with right_col:
 
         evidence_text = build_case_summary(selected_id, similarity_df.head(top_n_similar), drug_summary, procedure_summary, measurement_summary)
         st.markdown(f"_Research-oriented summary:_ {evidence_text}")
-
         st.caption("Patterns below are derived from the similar cohort only and are intended for retrospective exploration.")
-
         st.dataframe(drug_summary, use_container_width=True, hide_index=True)
 
 st.subheader("Similar cohort")
