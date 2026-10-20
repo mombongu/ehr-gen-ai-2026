@@ -1,5 +1,6 @@
 import os
 from pathlib import Path
+from datetime import datetime
 
 import pandas as pd
 import streamlit as st
@@ -56,6 +57,7 @@ def required_csv_map(data_dir):
         "drug": find_csv_file(data_dir, ["drug_exposure.csv", "drug*.csv"]),
         "procedure": find_csv_file(data_dir, ["procedure_occurrence.csv", "procedure*.csv"]),
         "measurement": find_csv_file(data_dir, ["measurement.csv", "measurement*.csv"]),
+        "concept": find_csv_file(data_dir, ["2b_concept.csv", "concept.csv"]),
     }
 
 
@@ -65,6 +67,23 @@ def load_table(filename):
     if not path.exists():
         return pd.DataFrame()
     return pd.read_csv(path, low_memory=False)
+
+
+@st.cache_data
+def load_concept_lookup():
+    concept_path = DATA_DIR / "2b_concept.csv"
+    if not concept_path.exists():
+        return {}
+
+    concept_df = pd.read_csv(concept_path, low_memory=False)
+    if "concept_id" not in concept_df.columns or "concept_name" not in concept_df.columns:
+        return {}
+
+    concept_df = concept_df[["concept_id", "concept_name"]].copy()
+    concept_df["concept_id"] = pd.to_numeric(concept_df["concept_id"], errors="coerce")
+    concept_df = concept_df.dropna(subset=["concept_id"]).drop_duplicates(subset=["concept_id"])
+    concept_df["concept_name"] = concept_df["concept_name"].fillna("Unknown")
+    return concept_df.set_index("concept_id")["concept_name"].to_dict()
 
 
 def normalize_patient_ids(series):
@@ -122,6 +141,55 @@ def build_case_summary(selected_id, similar_df, drug_summary, procedure_summary,
     )
 
 
+def map_concept_name(concept_id, concept_lookup):
+    if pd.isna(concept_id):
+        return "Unknown"
+    try:
+        value = int(float(concept_id))
+    except (TypeError, ValueError):
+        return str(concept_id)
+    if value == 0:
+        return "Unknown"
+    return concept_lookup.get(value, str(concept_id))
+
+
+def prepare_patient_condition_table(selected_patient_id, conditions, concept_lookup):
+    if conditions.empty:
+        return pd.DataFrame(columns=["Condition", "Start date", "Source value"])
+
+    rows = conditions[conditions["person_id"] == selected_patient_id].copy()
+    if rows.empty:
+        return pd.DataFrame(columns=["Condition", "Start date", "Source value"])
+
+    rows["condition_concept_id"] = pd.to_numeric(rows.get("condition_concept_id", pd.Series(dtype=float)), errors="coerce")
+    rows["Condition"] = rows["condition_concept_id"].apply(lambda cid: map_concept_name(cid, concept_lookup))
+    rows["Condition"] = rows["Condition"].replace({"Unknown": rows.get("condition_source_value", pd.Series(["Unknown"] * len(rows))).fillna("Unknown")})
+    rows["Start date"] = rows.get("condition_start_date", pd.Series([None] * len(rows)))
+    rows["Source value"] = rows.get("condition_source_value", pd.Series([None] * len(rows)))
+    rows = rows[["Condition", "Start date", "Source value"]]
+    rows = rows.drop_duplicates().sort_values(["Condition", "Start date"], na_position="last").reset_index(drop=True)
+    return rows
+
+
+def prepare_patient_medication_table(selected_patient_id, drugs, concept_lookup):
+    if drugs.empty:
+        return pd.DataFrame(columns=["Medication", "Start date", "Quantity", "Source value"])
+
+    rows = drugs[drugs["person_id"] == selected_patient_id].copy()
+    if rows.empty:
+        return pd.DataFrame(columns=["Medication", "Start date", "Quantity", "Source value"])
+
+    rows["drug_concept_id"] = pd.to_numeric(rows.get("drug_concept_id", pd.Series(dtype=float)), errors="coerce")
+    rows["Medication"] = rows["drug_concept_id"].apply(lambda cid: map_concept_name(cid, concept_lookup))
+    rows["Medication"] = rows["Medication"].replace({"Unknown": rows.get("drug_source_value", pd.Series(["Unknown"] * len(rows))).fillna("Unknown")})
+    rows["Start date"] = rows.get("drug_exposure_start_date", pd.Series([None] * len(rows)))
+    rows["Quantity"] = rows.get("quantity", pd.Series([None] * len(rows)))
+    rows["Source value"] = rows.get("drug_source_value", pd.Series([None] * len(rows)))
+    rows = rows[["Medication", "Start date", "Quantity", "Source value"]]
+    rows = rows.drop_duplicates().sort_values(["Medication", "Start date"], na_position="last").reset_index(drop=True)
+    return rows
+
+
 def generate_ai_summary(selected_patient_id, similarity_df, therapy_summary, procedure_summary, measurement_summary, metric_summary):
     if OpenAI is None:
         return "OpenAI support is not installed. Add the `openai` package and set `OPENAI_API_KEY` to enable this feature."
@@ -174,6 +242,84 @@ def generate_ai_summary(selected_patient_id, similarity_df, therapy_summary, pro
         return f"AI summary could not be generated: {exc}"
 
 
+def build_local_patient_answer(prompt, patient_row, condition_rows, medication_rows):
+    q = (prompt or "").lower()
+    condition_names = [str(value) for value in condition_rows["Condition"].dropna().tolist() if str(value).strip()][:20]
+    med_names = [str(value) for value in medication_rows["Medication"].dropna().tolist() if str(value).strip()][:20]
+
+    if any(term in q for term in ["condition", "diagnosis", "diagnoses", "problems", "problem"]):
+        if not condition_names:
+            return "This patient currently has no condition entries in the available OMOP record set."
+        return "Current conditions: " + "; ".join(condition_names)
+
+    if any(term in q for term in ["med", "medication", "drug", "prescription", "treatment", "therapy"]):
+        if not med_names:
+            return "This patient has no medication records in the available dataset."
+        return "Current medications: " + "; ".join(med_names)
+
+    if any(term in q for term in ["age", "years old", "birth"]):
+        year_of_birth = patient_row.get("year_of_birth")
+        if pd.notna(year_of_birth):
+            age = datetime.now().year - int(year_of_birth)
+            return f"Patient {patient_row.get('person_id')} is approximately {age} years old."
+        return "The dataset does not include a usable year of birth for this patient."
+
+    if any(term in q for term in ["sex", "gender"]):
+        gender = patient_row.get("gender_source_value")
+        if pd.notna(gender):
+            return f"This patient is recorded as {gender}."
+        return "Sex/gender is not clearly recorded in the available patient data."
+
+    if any(term in q for term in ["summary", "overview", "tell me about", "what stands out"]):
+        condition_text = ", ".join(condition_names) if condition_names else "no recorded conditions"
+        med_text = ", ".join(med_names) if med_names else "no recorded medications"
+        return (
+            f"Patient {patient_row.get('person_id')} has {len(condition_names)} recorded conditions "
+            f"({condition_text}) and {len(med_names)} medication entries ({med_text})."
+        )
+
+    if any(term in q for term in ["what is their name", "name", "patient id"]):
+        return f"This is Patient {patient_row.get('person_id')} from the selected OMOP record set."
+
+    return (
+        "I can answer questions about this patient’s conditions, medications, age, sex, and overall chart summary. "
+        f"Current conditions: {condition_names[:5] if condition_names else 'none'}; current medications: {med_names[:5] if med_names else 'none'}."
+    )
+
+
+def generate_patient_follow_up(selected_patient_id, patient_row, condition_rows, medication_rows, prompt):
+    if OpenAI is not None and os.getenv("OPENAI_API_KEY"):
+        context = {
+            "patient_id": int(selected_patient_id),
+            "gender": patient_row.get("gender_source_value", "Unknown"),
+            "race": patient_row.get("race_source_value", "Unknown"),
+            "year_of_birth": patient_row.get("year_of_birth"),
+            "conditions": condition_rows[["Condition", "Start date"]].head(20).to_dict(orient="records"),
+            "medications": medication_rows[["Medication", "Start date"]].head(20).to_dict(orient="records"),
+            "question": prompt,
+        }
+        client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+        try:
+            response = client.responses.create(
+                model="gpt-4o-mini",
+                input=[
+                    {
+                        "role": "system",
+                        "content": "You are a clinical chart assistant. Use only the provided patient information. Be careful, do not make clinical diagnoses. If a fact is missing, say it is not available."
+                    },
+                    {"role": "user", "content": f"Here is the patient chart context: {context}\n\nUser question: {prompt}"},
+                ],
+            )
+            if hasattr(response, "output_text") and response.output_text:
+                return response.output_text.strip()
+            if hasattr(response, "output") and response.output:
+                return response.output[0].content[0].text.value.strip()
+        except Exception:
+            pass
+
+    return build_local_patient_answer(prompt, patient_row, condition_rows, medication_rows)
+
+
 required_files = required_csv_map(DATA_DIR)
 available_csvs = sorted(
     [p.name for p in DATA_DIR.iterdir() if p.is_file() and p.suffix.lower() == ".csv"]
@@ -192,6 +338,7 @@ conditions = load_table(required_files["condition"].name if required_files["cond
 drugs = load_table(required_files["drug"].name if required_files["drug"] else "drug_exposure.csv")
 procedures = load_table(required_files["procedure"].name if required_files["procedure"] else "procedure_occurrence.csv")
 measurements = load_table(required_files["measurement"].name if required_files["measurement"] else "measurement.csv")
+concept_lookup = load_concept_lookup()
 
 st.title("Clinical Patient Explorer")
 st.caption("Explore a patient, compare them with a similar cohort, and review the treatment patterns used in prior comparable cases.")
@@ -239,6 +386,61 @@ if not similarity_df.empty:
     ].sort_values(["Similarity", "Shared conditions"], ascending=[False, False]).reset_index(drop=True)
 
 similar_ids = similarity_df["Patient ID"].head(top_n_similar).tolist() if not similarity_df.empty else []
+
+selected_patient_row = person[person["person_id"] == selected_id].iloc[0].to_dict() if not person[person["person_id"] == selected_id].empty else {}
+selected_conditions = prepare_patient_condition_table(selected_id, conditions, concept_lookup)
+selected_medications = prepare_patient_medication_table(selected_id, drugs, concept_lookup)
+
+st.subheader("Selected patient")
+patient_meta = st.columns([1.3, 1.3, 1.3, 1.3, 1.3])
+patient_meta[0].metric("Patient ID", selected_id)
+patient_meta[1].metric("Conditions", len(selected_conditions))
+patient_meta[2].metric("Medications", len(selected_medications))
+patient_meta[3].metric("Similar patients", len(similar_ids))
+patient_meta[4].metric("Recorded age", f"{datetime.now().year - int(float(selected_patient_row.get('year_of_birth', 0))) if pd.notna(selected_patient_row.get('year_of_birth')) and str(selected_patient_row.get('year_of_birth')).strip() not in ['', 'nan'] else 'Unknown'}")
+
+# Clean demographic details
+sex_value = selected_patient_row.get("gender_source_value")
+race_value = selected_patient_row.get("race_source_value")
+ethnicity_value = selected_patient_row.get("ethnicity_source_value")
+
+info_cols = st.columns(4)
+info_cols[0].markdown(f"**Sex:** {sex_value if pd.notna(sex_value) and str(sex_value).strip() else 'Unknown'}")
+info_cols[1].markdown(f"**Race:** {race_value if pd.notna(race_value) and str(race_value).strip() else 'Unknown'}")
+info_cols[2].markdown(f"**Ethnicity:** {ethnicity_value if pd.notna(ethnicity_value) and str(ethnicity_value).strip() else 'Unknown'}")
+info_cols[3].markdown(f"**Condition ID count:** {len(selected_profile)}")
+
+st.subheader("Patient condition list")
+if selected_conditions.empty:
+    st.info("No condition records were found for this patient.")
+else:
+    st.dataframe(selected_conditions.head(50), use_container_width=True, hide_index=True)
+
+st.subheader("Patient medication list")
+if selected_medications.empty:
+    st.info("No medication records were found for this patient.")
+else:
+    st.dataframe(selected_medications.head(50), use_container_width=True, hide_index=True)
+
+st.subheader("Ask about this patient")
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = [
+        {"role": "assistant", "content": "Ask me about this patient’s conditions, medications, age, or overall chart overview."}
+    ]
+
+for msg in st.session_state.chat_history:
+    with st.chat_message(msg["role"]):
+        st.write(msg["content"])
+
+prompt = st.chat_input("Ask a follow-up question about this patient")
+if prompt:
+    st.session_state.chat_history.append({"role": "user", "content": prompt})
+    response = generate_patient_follow_up(selected_id, selected_patient_row, selected_conditions, selected_medications, prompt)
+    st.session_state.chat_history.append({"role": "assistant", "content": response})
+    with st.chat_message("user"):
+        st.write(prompt)
+    with st.chat_message("assistant"):
+        st.write(response)
 
 st.subheader("Patient overview")
 metric_cols = st.columns(4)
@@ -384,7 +586,9 @@ with medication_col:
         rows = drugs[drugs["person_id"] == selected_id].copy()
         cols = [c for c in ["drug_exposure_start_date", "drug_source_value", "drug_concept_id", "quantity"] if c in rows.columns]
         if cols:
-            st.dataframe(rows[cols].head(25), use_container_width=True, hide_index=True)
+            rows["Medication"] = rows["drug_concept_id"].apply(lambda cid: map_concept_name(cid, concept_lookup))
+            rows["Medication"] = rows["Medication"].replace({"Unknown": rows.get("drug_source_value", pd.Series(["Unknown"] * len(rows))).fillna("Unknown")})
+            st.dataframe(rows[["drug_exposure_start_date", "Medication", "quantity"] if "quantity" in rows.columns else ["drug_exposure_start_date", "Medication"]].head(25), use_container_width=True, hide_index=True)
         else:
             st.info("Medication fields are not available for this dataset.")
     else:
