@@ -34,11 +34,14 @@ def prepare_patient_condition_table(selected_patient_id, conditions, concept_loo
     if rows.empty:
         return pd.DataFrame(columns=["Condition", "Start date", "Source value"])
 
-    rows["condition_concept_id"] = pd.to_numeric(rows.get("condition_concept_id", pd.Series(dtype=float)), errors="coerce")
+    rows["condition_concept_id"] = pd.to_numeric(
+        rows.get("condition_concept_id", pd.Series(dtype=float)), errors="coerce"
+    )
     rows["Condition"] = rows["condition_concept_id"].apply(lambda cid: map_concept_name(cid, concept_lookup))
-    rows["Condition"] = rows["Condition"].replace({
-        "Unknown": rows.get("condition_source_value", pd.Series(["Unknown"] * len(rows))).fillna("Unknown")
-    })
+    unknown_mask = rows["Condition"].eq("Unknown")
+    if unknown_mask.any():
+        rows.loc[unknown_mask, "Condition"] = rows.loc[unknown_mask, "condition_source_value"].fillna("Unknown")
+
     rows["Start date"] = rows.get("condition_start_date", pd.Series([None] * len(rows)))
     rows["Source value"] = rows.get("condition_source_value", pd.Series([None] * len(rows)))
     rows = rows[["Condition", "Start date", "Source value"]]
@@ -54,11 +57,14 @@ def prepare_patient_medication_table(selected_patient_id, drugs, concept_lookup)
     if rows.empty:
         return pd.DataFrame(columns=["Medication", "Start date", "Quantity", "Source value"])
 
-    rows["drug_concept_id"] = pd.to_numeric(rows.get("drug_concept_id", pd.Series(dtype=float)), errors="coerce")
+    rows["drug_concept_id"] = pd.to_numeric(
+        rows.get("drug_concept_id", pd.Series(dtype=float)), errors="coerce"
+    )
     rows["Medication"] = rows["drug_concept_id"].apply(lambda cid: map_concept_name(cid, concept_lookup))
-    rows["Medication"] = rows["Medication"].replace({
-        "Unknown": rows.get("drug_source_value", pd.Series(["Unknown"] * len(rows))).fillna("Unknown")
-    })
+    unknown_mask = rows["Medication"].eq("Unknown")
+    if unknown_mask.any():
+        rows.loc[unknown_mask, "Medication"] = rows.loc[unknown_mask, "drug_source_value"].fillna("Unknown")
+
     rows["Start date"] = rows.get("drug_exposure_start_date", pd.Series([None] * len(rows)))
     rows["Quantity"] = rows.get("quantity", pd.Series([None] * len(rows)))
     rows["Source value"] = rows.get("drug_source_value", pd.Series([None] * len(rows)))
