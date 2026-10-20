@@ -15,7 +15,22 @@ st.set_page_config(
     layout="wide",
 )
 
-DATA_DIR = Path(__file__).parent / "0.9" / "1_omop_data_csv"
+
+def find_data_dir():
+    base_dir = Path(__file__).resolve().parent
+    candidates = [
+        base_dir / "1_omop_data_csv",
+        base_dir / "1_omop_Data_csv",
+        base_dir / "0.9" / "1_omop_data_csv",
+        base_dir / "0.9" / "1_omop_Data_csv",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return base_dir / "1_omop_data_csv"
+
+
+DATA_DIR = find_data_dir()
 
 
 @st.cache_data
@@ -44,25 +59,53 @@ def similarity(a, b):
     return len(a & b) / len(union) if union else 0.0
 
 
-def summarize_therapy(df, patient_ids):
-    if df.empty or df is None:
-        return pd.DataFrame(columns=["Therapy", "Similar patients"])
+def summarize_common_field(df, patient_ids, label_columns, label_name, value_name):
+    if df is None or df.empty or not patient_ids:
+        return pd.DataFrame(columns=[label_name, value_name])
 
-    candidate = df[df["person_id"].isin(patient_ids)].copy()
-    if candidate.empty:
-        return pd.DataFrame(columns=["Therapy", "Similar patients"])
+    cohort = df[df["person_id"].isin(patient_ids)].copy()
+    if cohort.empty:
+        return pd.DataFrame(columns=[label_name, value_name])
 
-    label_column = "drug_source_value" if "drug_source_value" in candidate.columns else "drug_concept_id"
-    candidate["therapy_label"] = candidate[label_column].fillna("Unknown").astype(str)
+    label_col = None
+    for candidate in label_columns:
+        if candidate in cohort.columns:
+            label_col = candidate
+            break
+    if label_col is None:
+        return pd.DataFrame(columns=[label_name, value_name])
+
+    cohort["label_value"] = cohort[label_col].fillna("Unknown").astype(str)
     summary = (
-        candidate.groupby("therapy_label", as_index=False)["person_id"]
+        cohort.groupby("label_value", as_index=False)["person_id"]
         .nunique()
-        .rename(columns={"therapy_label": "Therapy", "person_id": "Similar patients"})
+        .rename(columns={"label_value": label_name, "person_id": value_name})
     )
-    return summary.sort_values("Similar patients", ascending=False).head(10)
+    return summary.sort_values(value_name, ascending=False).head(10).reset_index(drop=True)
 
 
-def generate_ai_summary(selected_patient_id, similarity_df, therapy_summary, metric_summary):
+def build_case_summary(selected_id, similar_df, drug_summary, procedure_summary, measurement_summary):
+    evidence = {
+        "selected_patient_id": selected_id,
+        "similar_patient_count": len(similar_df),
+        "top_drugs": drug_summary.head(5).to_dict(orient="records"),
+        "top_procedures": procedure_summary.head(5).to_dict(orient="records"),
+        "top_measurements": measurement_summary.head(5).to_dict(orient="records"),
+        "top_similar_patients": similar_df.head(5).to_dict(orient="records"),
+    }
+
+    top_drug = drug_summary.iloc[0]["Drug"] if not drug_summary.empty else "no common drug pattern"
+    top_proc = procedure_summary.iloc[0]["Procedure"] if not procedure_summary.empty else "no common procedure pattern"
+    top_meas = measurement_summary.iloc[0]["Measurement"] if not measurement_summary.empty else "no common lab pattern"
+
+    return (
+        f"Based on the {len(similar_df)} patients most similar to Patient {selected_id}, the most common patterns include "
+        f"{top_drug}, {top_proc}, and {top_meas}. This retrospective view highlights the treatment and procedure patterns "
+        f"typically observed in comparable OMOP cohorts, but it should be interpreted as exploratory clinical research rather than a verified care recommendation."
+    )
+
+
+def generate_ai_summary(selected_patient_id, similarity_df, therapy_summary, procedure_summary, measurement_summary, metric_summary):
     if OpenAI is None:
         return "OpenAI support is not installed. Add the `openai` package and set `OPENAI_API_KEY` to enable this feature."
 
@@ -71,12 +114,15 @@ def generate_ai_summary(selected_patient_id, similarity_df, therapy_summary, met
         return "Set the `OPENAI_API_KEY` environment variable to enable the optional AI summary."
 
     top_matches = similarity_df.head(5).copy()
-    top_matches["Similarity"] = top_matches["Similarity"].round(3)
+    if not top_matches.empty:
+        top_matches["Similarity"] = top_matches["Similarity"].round(3)
 
     context = {
         "selected_patient_id": selected_patient_id,
         "similarity": top_matches.to_dict(orient="records"),
         "therapy_summary": therapy_summary.head(5).to_dict(orient="records"),
+        "procedure_summary": procedure_summary.head(5).to_dict(orient="records"),
+        "measurement_summary": measurement_summary.head(5).to_dict(orient="records"),
         "outcome_metrics": metric_summary,
     }
 
@@ -118,7 +164,7 @@ procedures = load_table("procedure_occurrence.csv")
 measurements = load_table("measurement.csv")
 
 st.title("Clinical Patient Explorer")
-st.caption("Explore a patient, compare them with a similar cohort, and review their treatment and outcome context.")
+st.caption("Explore a patient, compare them with a similar cohort, and review the treatment patterns used in prior comparable cases.")
 
 if person.empty or conditions.empty:
     st.error(f"Could not find required files in {DATA_DIR}")
@@ -131,8 +177,12 @@ if not patient_ids:
 
 profiles = {pid: get_condition_profile(conditions, pid) for pid in patient_ids}
 
-selected_id = st.selectbox("Patient selector", patient_ids, format_func=lambda pid: f"Patient {pid}")
+st.sidebar.header("Patient and cohort filters")
+selected_id = st.sidebar.selectbox("Patient selector", patient_ids, format_func=lambda pid: f"Patient {pid}")
 selected_profile = profiles.get(selected_id, set())
+
+similarity_limit = st.sidebar.slider("Minimum similarity score", min_value=0.0, max_value=0.5, value=0.0, step=0.01)
+top_n_similar = st.sidebar.slider("Top similar patients to show", min_value=5, max_value=50, value=10, step=1)
 
 similarity_rows = []
 for pid in patient_ids:
@@ -145,36 +195,129 @@ for pid in patient_ids:
         {
             "Patient ID": pid,
             "Similarity": round(score, 3),
-            "Shared condition concepts": shared,
+            "Shared conditions": shared,
         }
     )
 
 similarity_df = pd.DataFrame(similarity_rows)
 if not similarity_df.empty:
-    similarity_df = similarity_df.sort_values(
-        ["Similarity", "Shared condition concepts"],
-        ascending=[False, False],
-    ).reset_index(drop=True)
+    similarity_df = similarity_df[
+        similarity_df["Similarity"] >= similarity_limit
+    ].sort_values(["Similarity", "Shared conditions"], ascending=[False, False]).reset_index(drop=True)
+
+similar_ids = similarity_df["Patient ID"].head(top_n_similar).tolist() if not similarity_df.empty else []
+
+st.subheader("Patient overview")
+metric_cols = st.columns(4)
+metric_cols[0].metric("Unique conditions", len(selected_profile))
+metric_cols[1].metric("Similar patients", len(similar_ids))
+metric_cols[2].metric(
+    "Drug exposure records",
+    len(drugs[drugs["person_id"] == selected_id]) if not drugs.empty else 0,
+)
+metric_cols[3].metric(
+    "Procedure records",
+    len(procedures[procedures["person_id"] == selected_id]) if not procedures.empty else 0,
+)
 
 left_col, right_col = st.columns([1.1, 1.4])
 
 with left_col:
     st.subheader("Similarity chart")
-    if not similarity_df.empty:
-        chart_df = similarity_df.head(8).sort_values("Similarity", ascending=True).copy()
+    if similarity_df.empty:
+        st.info("No similar patients are available for this patient profile.")
+    else:
+        chart_df = similarity_df.head(8).copy().sort_values("Similarity", ascending=True)
         chart_df["Patient ID"] = chart_df["Patient ID"].astype(str)
         st.bar_chart(chart_df.set_index("Patient ID")["Similarity"])
-    else:
-        st.info("No similar patients were found for this selection.")
 
 with right_col:
-    st.subheader("Therapy summary")
-    similar_patient_ids = similarity_df["Patient ID"].head(10).tolist() if not similarity_df.empty else []
-    therapy_summary = summarize_therapy(drugs, similar_patient_ids)
-    if therapy_summary.empty:
-        st.info("Drug exposure data for the similar cohort is not available.")
+    st.subheader("What has been done before in similar cases?")
+    if not similar_ids:
+        st.info("No comparable patients meet the current similarity threshold.")
     else:
-        st.dataframe(therapy_summary, use_container_width=True, hide_index=True)
+        drug_summary = summarize_common_field(
+            drugs,
+            similar_ids,
+            ["drug_source_value", "drug_concept_id"],
+            "Drug",
+            "Patients",
+        )
+        procedure_summary = summarize_common_field(
+            procedures,
+            similar_ids,
+            ["procedure_source_value", "procedure_concept_id"],
+            "Procedure",
+            "Patients",
+        )
+        measurement_summary = summarize_common_field(
+            measurements,
+            similar_ids,
+            ["measurement_source_value", "measurement_concept_id"],
+            "Measurement",
+            "Patients",
+        )
+
+        evidence_text = build_case_summary(selected_id, similarity_df.head(top_n_similar), drug_summary, procedure_summary, measurement_summary)
+        st.markdown(f"_Research-oriented summary:_ {evidence_text}")
+
+        st.caption("Patterns below are derived from the similar cohort only and are intended for retrospective exploration.")
+
+        st.dataframe(drug_summary, use_container_width=True, hide_index=True)
+
+st.subheader("Similar cohort")
+if similarity_df.empty:
+    st.info("No comparable patients are available for this patient profile.")
+else:
+    table_df = similarity_df.head(top_n_similar).copy()
+    table_df["Similarity"] = table_df["Similarity"].round(3)
+    st.dataframe(table_df, use_container_width=True, hide_index=True)
+
+if similar_ids:
+    drug_summary = summarize_common_field(
+        drugs,
+        similar_ids,
+        ["drug_source_value", "drug_concept_id"],
+        "Drug",
+        "Patients",
+    )
+    procedure_summary = summarize_common_field(
+        procedures,
+        similar_ids,
+        ["procedure_source_value", "procedure_concept_id"],
+        "Procedure",
+        "Patients",
+    )
+    measurement_summary = summarize_common_field(
+        measurements,
+        similar_ids,
+        ["measurement_source_value", "measurement_concept_id"],
+        "Measurement",
+        "Patients",
+    )
+
+    col1, col2, col3 = st.columns(3)
+
+    with col1:
+        st.subheader("Common medications")
+        if drug_summary.empty:
+            st.info("No medication patterns found in the similar cohort.")
+        else:
+            st.dataframe(drug_summary, use_container_width=True, hide_index=True)
+
+    with col2:
+        st.subheader("Common procedures")
+        if procedure_summary.empty:
+            st.info("No procedure patterns found in the similar cohort.")
+        else:
+            st.dataframe(procedure_summary, use_container_width=True, hide_index=True)
+
+    with col3:
+        st.subheader("Common measurements")
+        if measurement_summary.empty:
+            st.info("No measurement patterns found in the similar cohort.")
+        else:
+            st.dataframe(measurement_summary, use_container_width=True, hide_index=True)
 
     st.subheader("OpenAI summary")
     openai_ready = OpenAI is not None and bool(os.getenv("OPENAI_API_KEY"))
@@ -182,7 +325,7 @@ with right_col:
         st.caption("Optional: install the `openai` package and set `OPENAI_API_KEY` to enable this summary.")
 
     if st.button("Generate AI summary", type="primary", use_container_width=True, disabled=not openai_ready):
-        with st.spinner("Generating a brief cohort summary..."):
+        with st.spinner("Generating a research-oriented summary..."):
             metric_summary = {
                 "selected_patient_id": int(selected_id),
                 "unique_conditions": len(selected_profile),
@@ -191,32 +334,15 @@ with right_col:
                 "measurement_records": len(measurements[measurements["person_id"] == selected_id]) if not measurements.empty else 0,
                 "avg_cohort_similarity": round(similarity_df["Similarity"].mean(), 3) if not similarity_df.empty else 0.0,
             }
-            summary = generate_ai_summary(selected_id, similarity_df, therapy_summary, metric_summary)
+            summary = generate_ai_summary(
+                selected_id,
+                similarity_df,
+                drug_summary,
+                procedure_summary,
+                measurement_summary,
+                metric_summary,
+            )
         st.markdown(summary)
-
-st.subheader("Outcome metrics")
-metric_cols = st.columns(4)
-metric_cols[0].metric("Unique conditions", len(selected_profile))
-metric_cols[1].metric(
-    "Drug exposure records",
-    len(drugs[drugs["person_id"] == selected_id]) if not drugs.empty else 0,
-)
-metric_cols[2].metric(
-    "Procedure records",
-    len(procedures[procedures["person_id"] == selected_id]) if not procedures.empty else 0,
-)
-metric_cols[3].metric(
-    "Measurement records",
-    len(measurements[measurements["person_id"] == selected_id]) if not measurements.empty else 0,
-)
-
-st.subheader("Similar cohort")
-if similarity_df.empty:
-    st.info("No comparable patients are available for this patient profile.")
-else:
-    table_df = similarity_df.head(10).copy()
-    table_df["Similarity"] = table_df["Similarity"].round(3)
-    st.dataframe(table_df, use_container_width=True, hide_index=True)
 
 st.subheader("Patient detail")
 medication_col, procedure_col, measurement_col = st.columns(3)
